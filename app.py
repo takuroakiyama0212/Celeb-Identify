@@ -511,44 +511,38 @@ with st.sidebar:
             st.markdown(f"• **{name}**")
             st.caption(f"  {info['known_for'][:40]}...")
 
-# File uploader
-uploaded_file = st.file_uploader(
-    "Choose an image...",
-    type=['jpg', 'jpeg', 'png'],
-    help="Upload a clear photo with a visible face for best results"
+# Mode selection
+upload_mode = st.radio(
+    "Upload Mode",
+    ["Single Image", "Batch Processing"],
+    horizontal=True,
+    help="Choose to analyze one image or multiple images at once"
 )
 
-if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📷 Your Photo")
-        st.image(image, use_container_width=True)
-    
-    face_cascade = load_face_detector()
+if upload_mode == "Single Image":
+    # Single file uploader
+    uploaded_file = st.file_uploader(
+        "Choose an image...",
+        type=['jpg', 'jpeg', 'png'],
+        help="Upload a clear photo with a visible face for best results"
+    )
+    uploaded_files = [uploaded_file] if uploaded_file else []
+else:
+    # Multiple file uploader
+    uploaded_files = st.file_uploader(
+        "Choose multiple images...",
+        type=['jpg', 'jpeg', 'png'],
+        accept_multiple_files=True,
+        help="Upload multiple photos to analyze them all at once"
+    )
+
+def process_single_image(image, face_cascade, feature_model, openai_client, use_ai_mode, confidence_threshold):
+    """Process a single image and return results"""
     faces = []
+    img_array = None
     
     if face_cascade is not None:
         faces, img_array = detect_faces(image, face_cascade)
-        
-        with col2:
-            st.subheader("🔍 Face Detection")
-            if len(faces) > 0:
-                img_with_faces = draw_faces_on_image(img_array, faces)
-                st.image(img_with_faces, use_container_width=True)
-                st.success(f"✓ Detected {len(faces)} face(s)")
-            else:
-                st.image(image, use_container_width=True)
-                st.warning("No face detected - analyzing full image")
-    else:
-        with col2:
-            st.subheader("🔍 Preview")
-            st.image(image, use_container_width=True)
-    
-    st.divider()
-    st.subheader("🎯 Celebrity Match Results")
     
     # Get face region for analysis
     if len(faces) > 0:
@@ -556,87 +550,232 @@ if uploaded_file is not None:
     else:
         face_image = image
     
+    matches = []
+    analysis_notes = ""
+    
     # Perform analysis
     if use_ai_mode:
-        with st.spinner("🧠 AI is analyzing your photo..."):
-            base64_img = image_to_base64(image)
-            result = analyze_with_openai(openai_client, base64_img)
+        base64_img = image_to_base64(image)
+        result = analyze_with_openai(openai_client, base64_img)
         
-        if "error" in result:
-            st.warning(f"AI analysis failed: {result['error']}. Falling back to ML mode.")
-            use_ai_mode = False
-        else:
+        if "error" not in result:
             matches = result.get("matches", [])
             analysis_notes = result.get("analysis_notes", "")
     
-    if not use_ai_mode:
-        with st.spinner("🧠 Analyzing facial features..."):
-            features = extract_features(face_image, feature_model)
-            image_props = analyze_image_properties(face_image)
-            matches = match_celebrities_with_features(features, image_props, confidence_threshold)
-            analysis_notes = ""
+    if not matches and feature_model is not None:
+        features = extract_features(face_image, feature_model)
+        image_props = analyze_image_properties(face_image)
+        matches = match_celebrities_with_features(features, image_props, confidence_threshold)
     
-    # Display results
-    if matches:
-        st.markdown("**Your Top Celebrity Lookalikes:**")
+    return {
+        'faces': faces,
+        'img_array': img_array,
+        'matches': matches,
+        'analysis_notes': analysis_notes
+    }
+
+if uploaded_files and len(uploaded_files) > 0 and uploaded_files[0] is not None:
+    face_cascade = load_face_detector()
+    
+    # Batch processing mode
+    if upload_mode == "Batch Processing" and len(uploaded_files) > 1:
+        st.subheader(f"📊 Batch Analysis: {len(uploaded_files)} Images")
         
-        for i, match in enumerate(matches, 1):
-            with st.container():
-                col_rank, col_info, col_bar = st.columns([1, 4, 5])
-                
-                with col_rank:
-                    if i == 1:
-                        st.markdown("### 🥇")
-                    elif i == 2:
-                        st.markdown("### 🥈")
-                    elif i == 3:
-                        st.markdown("### 🥉")
-                    else:
-                        st.markdown(f"### #{i}")
-                
-                with col_info:
-                    st.markdown(f"**{match['name']}**")
-                    known_for = match.get('known_for', CELEBRITY_DATABASE.get(match['name'], {}).get('known_for', ''))
-                    if known_for:
-                        st.caption(f"Known for: {known_for[:45]}...")
-                
-                with col_bar:
-                    confidence = min(100, max(0, match.get('confidence', 50)))
-                    st.progress(confidence / 100)
-                    st.caption(f"{confidence:.0f}% match")
-                
-                if match.get('reason'):
-                    st.caption(f"💡 {match['reason']}")
-                
-                st.markdown("---")
+        all_results = []
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        # Best match card
+        for idx, uploaded_file in enumerate(uploaded_files):
+            status_text.text(f"Analyzing image {idx + 1} of {len(uploaded_files)}...")
+            progress_bar.progress((idx + 1) / len(uploaded_files))
+            
+            image = Image.open(uploaded_file)
+            result = process_single_image(
+                image, face_cascade, feature_model, 
+                openai_client, use_ai_mode, confidence_threshold
+            )
+            result['image'] = image
+            result['filename'] = uploaded_file.name
+            all_results.append(result)
+        
+        status_text.text("Analysis complete!")
+        
         st.divider()
-        best_match = matches[0]
-        best_name = best_match['name']
-        celeb_info = CELEBRITY_DATABASE.get(best_name, {})
         
-        st.success(f"""
-        ### 🏆 Best Match: **{best_name}**
+        # Display results in a grid/table format
+        for idx, result in enumerate(all_results):
+            with st.expander(f"📷 {result['filename']}", expanded=(idx == 0)):
+                col1, col2 = st.columns([1, 2])
+                
+                with col1:
+                    st.image(result['image'], use_container_width=True)
+                    if len(result['faces']) > 0:
+                        st.success(f"✓ {len(result['faces'])} face(s) detected")
+                    else:
+                        st.warning("No face detected")
+                
+                with col2:
+                    if result['matches']:
+                        st.markdown("**Top Matches:**")
+                        for i, match in enumerate(result['matches'][:3], 1):
+                            medal = "🥇" if i == 1 else ("🥈" if i == 2 else "🥉")
+                            confidence = match.get('confidence', 0)
+                            st.markdown(f"{medal} **{match['name']}** - {confidence:.0f}%")
+                    else:
+                        st.info("No matches found")
+            
+            st.markdown("---")
         
-        You most closely resemble **{best_name}** with a **{best_match.get('confidence', 0):.0f}%** similarity!
-        """)
+        # Summary statistics
+        st.subheader("📈 Batch Summary")
         
-        # Celebrity info card
-        if celeb_info:
-            with st.expander(f"📋 About {best_name}", expanded=True):
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.markdown(f"**Known For:** {celeb_info.get('known_for', 'N/A')}")
-                    st.markdown(f"**Born:** {celeb_info.get('birth_year', 'N/A')}")
-                with col_b:
-                    st.markdown(f"**Bio:** {celeb_info.get('bio', 'N/A')}")
+        col_stat1, col_stat2, col_stat3 = st.columns(3)
         
-        if analysis_notes:
-            with st.expander("📊 Detailed Analysis"):
-                st.markdown(f"**Analysis Notes:**\n\n{analysis_notes}")
+        with col_stat1:
+            total_faces = sum(len(r['faces']) for r in all_results)
+            st.metric("Total Faces Detected", total_faces)
+        
+        with col_stat2:
+            images_with_matches = sum(1 for r in all_results if r['matches'])
+            st.metric("Images with Matches", images_with_matches)
+        
+        with col_stat3:
+            # Most common celebrity
+            all_celebs = []
+            for r in all_results:
+                if r['matches']:
+                    all_celebs.append(r['matches'][0]['name'])
+            if all_celebs:
+                from collections import Counter
+                most_common = Counter(all_celebs).most_common(1)[0][0]
+                st.metric("Most Common Match", most_common)
+            else:
+                st.metric("Most Common Match", "N/A")
+    
     else:
-        st.warning("No matches found above the confidence threshold. Try lowering the threshold or using a clearer photo.")
+        # Single image mode
+        uploaded_file = uploaded_files[0]
+        image = Image.open(uploaded_file)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📷 Your Photo")
+            st.image(image, use_container_width=True)
+        
+        faces = []
+        
+        if face_cascade is not None:
+            faces, img_array = detect_faces(image, face_cascade)
+            
+            with col2:
+                st.subheader("🔍 Face Detection")
+                if len(faces) > 0:
+                    img_with_faces = draw_faces_on_image(img_array, faces)
+                    st.image(img_with_faces, use_container_width=True)
+                    st.success(f"✓ Detected {len(faces)} face(s)")
+                else:
+                    st.image(image, use_container_width=True)
+                    st.warning("No face detected - analyzing full image")
+        else:
+            with col2:
+                st.subheader("🔍 Preview")
+                st.image(image, use_container_width=True)
+        
+        st.divider()
+        st.subheader("🎯 Celebrity Match Results")
+        
+        # Get face region for analysis
+        if len(faces) > 0:
+            face_image = extract_face_region(image, faces)
+        else:
+            face_image = image
+        
+        matches = []
+        analysis_notes = ""
+        
+        # Perform analysis
+        current_ai_mode = use_ai_mode
+        if current_ai_mode:
+            with st.spinner("🧠 AI is analyzing your photo..."):
+                base64_img = image_to_base64(image)
+                result = analyze_with_openai(openai_client, base64_img)
+            
+            if "error" in result:
+                st.warning(f"AI analysis failed: {result['error']}. Falling back to ML mode.")
+                current_ai_mode = False
+            else:
+                matches = result.get("matches", [])
+                analysis_notes = result.get("analysis_notes", "")
+        
+        if not current_ai_mode:
+            with st.spinner("🧠 Analyzing facial features..."):
+                features = extract_features(face_image, feature_model)
+                image_props = analyze_image_properties(face_image)
+                matches = match_celebrities_with_features(features, image_props, confidence_threshold)
+                analysis_notes = ""
+        
+        # Display results
+        if matches:
+            st.markdown("**Your Top Celebrity Lookalikes:**")
+            
+            for i, match in enumerate(matches, 1):
+                with st.container():
+                    col_rank, col_info, col_bar = st.columns([1, 4, 5])
+                    
+                    with col_rank:
+                        if i == 1:
+                            st.markdown("### 🥇")
+                        elif i == 2:
+                            st.markdown("### 🥈")
+                        elif i == 3:
+                            st.markdown("### 🥉")
+                        else:
+                            st.markdown(f"### #{i}")
+                    
+                    with col_info:
+                        st.markdown(f"**{match['name']}**")
+                        known_for = match.get('known_for', CELEBRITY_DATABASE.get(match['name'], {}).get('known_for', ''))
+                        if known_for:
+                            st.caption(f"Known for: {known_for[:45]}...")
+                    
+                    with col_bar:
+                        confidence = min(100, max(0, match.get('confidence', 50)))
+                        st.progress(confidence / 100)
+                        st.caption(f"{confidence:.0f}% match")
+                    
+                    if match.get('reason'):
+                        st.caption(f"💡 {match['reason']}")
+                    
+                    st.markdown("---")
+            
+            # Best match card
+            st.divider()
+            best_match = matches[0]
+            best_name = best_match['name']
+            celeb_info = CELEBRITY_DATABASE.get(best_name, {})
+            
+            st.success(f"""
+            ### 🏆 Best Match: **{best_name}**
+            
+            You most closely resemble **{best_name}** with a **{best_match.get('confidence', 0):.0f}%** similarity!
+            """)
+            
+            # Celebrity info card
+            if celeb_info:
+                with st.expander(f"📋 About {best_name}", expanded=True):
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.markdown(f"**Known For:** {celeb_info.get('known_for', 'N/A')}")
+                        st.markdown(f"**Born:** {celeb_info.get('birth_year', 'N/A')}")
+                    with col_b:
+                        st.markdown(f"**Bio:** {celeb_info.get('bio', 'N/A')}")
+            
+            if analysis_notes:
+                with st.expander("📊 Detailed Analysis"):
+                    st.markdown(f"**Analysis Notes:**\n\n{analysis_notes}")
+        else:
+            st.warning("No matches found above the confidence threshold. Try lowering the threshold or using a clearer photo.")
 
 else:
     st.markdown("### 👆 Upload a photo to find your celebrity lookalike!")
