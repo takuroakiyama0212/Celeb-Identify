@@ -482,13 +482,15 @@ with st.sidebar:
         4. **Celebrity Matching** - AI identifies lookalikes
         """)
     else:
-        st.info("🧠 **Deep Learning Mode Active**")
+        st.info("🎭 **Demo Mode Active**")
         st.markdown("""
         Using neural network feature analysis:
         1. **Upload Photo** - Provide a clear face image
         2. **Face Detection** - OpenCV locates faces
         3. **Feature Extraction** - MobileNetV2 analyzes image
-        4. **Celebrity Matching** - Features compared to database
+        4. **Fun Matching** - Generates entertainment results
+        
+        *Add OpenAI API key for accurate celebrity matching*
         """)
     
     st.divider()
@@ -801,5 +803,5 @@ else:
 
 # Footer
 st.markdown("---")
-mode_text = "AI Vision" if use_ai_mode else "Deep Learning"
-st.caption(f"Celebrity Image Classifier | Powered by {mode_text} | For entertainment purposes")
+mode_text = "AI Vision" if use_ai_mode else "Demo Mode"
+st.caption(f"Celebrity Image Classifier | Powered by {mode_text} | For entertainment purposes only")
