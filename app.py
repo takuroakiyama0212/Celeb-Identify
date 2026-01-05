@@ -1,7 +1,14 @@
 import streamlit as st
 import numpy as np
 from PIL import Image
-import cv2
+try:
+    import cv2  # type: ignore
+    CV2_AVAILABLE = True
+    CV2_IMPORT_ERROR = ""
+except Exception as _e:  # pragma: no cover
+    cv2 = None  # type: ignore
+    CV2_AVAILABLE = False
+    CV2_IMPORT_ERROR = str(_e)
 import base64
 import io
 import json
@@ -237,6 +244,8 @@ except ImportError:
 @st.cache_resource
 def load_face_detector():
     """Load OpenCV's pre-trained face detector"""
+    if not CV2_AVAILABLE:
+        return None
     try:
         face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         return face_cascade
@@ -265,6 +274,8 @@ def get_openai_client():
 
 def detect_faces(image, face_cascade):
     """Detect faces in the image"""
+    if not CV2_AVAILABLE or face_cascade is None:
+        return [], np.array(image)
     img_array = np.array(image)
     if len(img_array.shape) == 3 and img_array.shape[2] == 4:
         img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
@@ -305,6 +316,34 @@ def extract_features(image, model):
     features = model.predict(img_array, verbose=0)
     return features.flatten()
 
+def extract_local_features(image):
+    """Extract lightweight local features using OpenCV (no TensorFlow required)."""
+    img_array = np.array(image)
+    # Robust grayscale conversion without relying on cv2 (Streamlit Cloud sometimes fails importing cv2)
+    if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+        img_array = img_array[:, :, :3]
+    if len(img_array.shape) == 3:
+        gray = (0.299 * img_array[:, :, 0] + 0.587 * img_array[:, :, 1] + 0.114 * img_array[:, :, 2]).astype(np.float32)
+    else:
+        gray = img_array.astype(np.float32)
+
+    # Resize via PIL to avoid cv2 dependency
+    gray_img = Image.fromarray(np.clip(gray, 0, 255).astype(np.uint8)).resize((96, 96))
+    gray_small = np.array(gray_img).astype(np.float32) / 255.0
+
+    # Simple gradients as texture proxy
+    gx = np.abs(np.diff(gray_small, axis=1))
+    gy = np.abs(np.diff(gray_small, axis=0))
+    g = np.pad(gx, ((0, 0), (0, 1))) + np.pad(gy, ((0, 1), (0, 0)))
+
+    # Histogram of intensities + histogram of gradients
+    hist_i, _ = np.histogram(gray_small, bins=32, range=(0.0, 1.0), density=True)
+    hist_g, _ = np.histogram(g, bins=32, range=(0.0, 1.0), density=True)
+
+    feat = np.concatenate([hist_i.astype(np.float32), hist_g.astype(np.float32)], axis=0)
+    feat = feat / (np.linalg.norm(feat) + 1e-8)
+    return feat
+
 def analyze_image_properties(image):
     """Analyze image color and texture properties"""
     img_array = np.array(image.resize((224, 224)))
@@ -320,10 +359,18 @@ def analyze_image_properties(image):
     
     brightness = np.mean(img_array)
     contrast = np.std(img_array)
-    
-    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray, 100, 200)
-    edge_density = np.sum(edges > 0) / edges.size
+
+    # Edge density (use cv2 when available, otherwise a numpy gradient fallback)
+    if CV2_AVAILABLE:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+        edge_density = float(np.sum(edges > 0) / edges.size)
+    else:
+        gray = (0.299 * img_array[:, :, 0] + 0.587 * img_array[:, :, 1] + 0.114 * img_array[:, :, 2]).astype(np.float32) / 255.0
+        gx = np.abs(np.diff(gray, axis=1))
+        gy = np.abs(np.diff(gray, axis=0))
+        g = np.pad(gx, ((0, 0), (0, 1))) + np.pad(gy, ((0, 1), (0, 0)))
+        edge_density = float(np.mean(g > 0.25))
     
     return {
         'brightness': brightness / 255,
@@ -333,46 +380,48 @@ def analyze_image_properties(image):
         'color_hash': int(r_mean * 1000 + g_mean * 100 + b_mean * 10) % 10000
     }
 
+def _name_seed(name: str) -> int:
+    # Stable deterministic seed without Python's randomized hash()
+    return int(sum((i + 1) * ord(c) for i, c in enumerate(name)) % 2**32)
+
 def match_celebrities_with_features(features, image_props, confidence_threshold=0):
-    """Match celebrities using deep learning features"""
+    """Match celebrities using a deterministic similarity projection (entertainment)."""
     celeb_names = list(CELEBRITY_DATABASE.keys())
-    num_celebs = len(celeb_names)
-    
-    feature_len = len(features)
-    chunk_size = feature_len // num_celebs
-    
+    dim = int(features.shape[0])
+
+    # Ensure unit vector
+    f = features.astype(np.float32)
+    f = f / (np.linalg.norm(f) + 1e-8)
+
     scores = []
-    for i, name in enumerate(celeb_names):
-        start_idx = (i * 37) % (feature_len - chunk_size)
-        chunk = features[start_idx:start_idx + chunk_size]
-        
-        base_score = np.mean(chunk) + np.std(chunk) * 0.3
-        
-        name_hash = sum(ord(c) for c in name) % 1000
-        feature_influence = (np.sum(features[:50]) * name_hash) % 100 / 1000
-        
+    for name in celeb_names:
+        rng = np.random.default_rng(_name_seed(name))
+        w = rng.standard_normal(dim).astype(np.float32)
+        w = w / (np.linalg.norm(w) + 1e-8)
+
+        sim = float(np.dot(f, w))  # [-1, 1]
         prop_influence = (
-            image_props['brightness'] * 0.1 +
-            image_props['contrast'] * 0.1 +
-            abs(image_props['warmth']) * 0.05 +
-            image_props['edge_density'] * 0.15
+            image_props['brightness'] * 0.06 +
+            image_props['contrast'] * 0.06 +
+            abs(image_props['warmth']) * 0.03 +
+            image_props['edge_density'] * 0.08
         )
-        
-        final_score = base_score + feature_influence + prop_influence
-        scores.append((name, final_score))
-    
+        score = sim + prop_influence
+        scores.append((name, score, sim))
+
     scores.sort(key=lambda x: x[1], reverse=True)
-    
+
+    # Convert to a friendly confidence for display
     top_scores = [s[1] for s in scores[:5]]
     min_score, max_score = min(top_scores), max(top_scores)
-    score_range = max_score - min_score if max_score != min_score else 1
-    
+    score_range = (max_score - min_score) if max_score != min_score else 1.0
+
     predictions = []
-    for i, (name, score) in enumerate(scores[:5]):
-        normalized = (score - min_score) / score_range
-        confidence = 50 + normalized * 35 - i * 5
-        confidence = max(30, min(95, confidence))
-        
+    for rank, (name, score, sim) in enumerate(scores[:5], 1):
+        normalized = (score - min_score) / score_range  # [0,1]
+        confidence = 45 + normalized * 45 - (rank - 1) * 4
+        confidence = float(max(25, min(92, confidence)))
+
         if confidence >= confidence_threshold:
             celeb_info = CELEBRITY_DATABASE[name]
             predictions.append({
@@ -381,9 +430,9 @@ def match_celebrities_with_features(features, image_props, confidence_threshold=
                 'known_for': celeb_info['known_for'],
                 'bio': celeb_info['bio'],
                 'birth_year': celeb_info['birth_year'],
-                'reason': f"Facial structure and features match detected"
+                'reason': "Lookalike suggestion based on facial structure cues (entertainment)"
             })
-    
+
     return predictions
 
 def image_to_base64(image):
@@ -395,28 +444,33 @@ def image_to_base64(image):
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 def analyze_with_openai(client, base64_image):
-    """Use OpenAI Vision for celebrity matching"""
+    """Use OpenAI Vision for celebrity lookalike suggestions (NOT identity)."""
     # the newest OpenAI model is "gpt-5" which was released August 7, 2025.
     # do not change this unless explicitly requested by the user
     
     celebrity_list = ", ".join(list(CELEBRITY_DATABASE.keys())[:25])
     
-    prompt = f"""Analyze this photo and identify which famous celebrities the person most closely resembles.
+    prompt = f"""You are a vision system that provides **celebrity lookalike suggestions** for entertainment.
 
-Consider facial features like face shape, eyes, nose, lips, jawline, and overall proportions.
+Important rules (must follow):
+- Do NOT identify the person in the photo.
+- Do NOT guess or claim who the person is (no "this is X", no real-person identification).
+- Only suggest **who they resemble**, using probabilistic language.
+- Focus only on visible facial features (face shape, eyes, nose, lips, jawline, proportions). Do not use clothing, background, text, or other cues.
+- If the face is not clearly visible, return an empty matches list and explain briefly in analysis_notes.
 
-Provide your top 5 celebrity matches. Choose from: {celebrity_list}, or other well-known celebrities.
+Provide your top 5 lookalike suggestions. You may choose from: {celebrity_list}, or other well-known celebrities.
 
 Respond in JSON format:
 {{
     "matches": [
-        {{"name": "Celebrity Name", "confidence": 85, "reason": "Brief explanation"}},
-        {{"name": "Celebrity Name 2", "confidence": 72, "reason": "Brief explanation"}},
-        {{"name": "Celebrity Name 3", "confidence": 65, "reason": "Brief explanation"}},
-        {{"name": "Celebrity Name 4", "confidence": 58, "reason": "Brief explanation"}},
-        {{"name": "Celebrity Name 5", "confidence": 52, "reason": "Brief explanation"}}
+        {{"name": "Celebrity Name", "confidence": 85, "reason": "Resemblance explanation based on facial features only"}},
+        {{"name": "Celebrity Name 2", "confidence": 72, "reason": "Resemblance explanation based on facial features only"}},
+        {{"name": "Celebrity Name 3", "confidence": 65, "reason": "Resemblance explanation based on facial features only"}},
+        {{"name": "Celebrity Name 4", "confidence": 58, "reason": "Resemblance explanation based on facial features only"}},
+        {{"name": "Celebrity Name 5", "confidence": 52, "reason": "Resemblance explanation based on facial features only"}}
     ],
-    "analysis_notes": "Brief overall analysis"
+    "analysis_notes": "Brief overall analysis (mention that this is not identification)"
 }}"""
 
     try:
@@ -444,10 +498,20 @@ Respond in JSON format:
         
         return result
     except Exception as e:
-        return {"error": str(e)}
+        msg = str(e)
+        # Common local misconfig: OPENAI_API_KEY is set to a placeholder containing non-ASCII characters.
+        if "ascii" in msg.lower() and "codec can't encode" in msg.lower():
+            msg = (
+                f"{msg}\n\n"
+                "Hint: OPENAI_API_KEY must be your real OpenAI key (ASCII, starts with 'sk-...'). "
+                "If you copied the placeholder text (e.g. containing Japanese characters), replace it with the actual key."
+            )
+        return {"error": msg}
 
 def draw_faces_on_image(img_array, faces):
     """Draw rectangles around detected faces"""
+    if not CV2_AVAILABLE:
+        return img_array
     img_with_faces = img_array.copy()
     for (x, y, w, h) in faces:
         cv2.rectangle(img_with_faces, (x, y), (x+w, y+h), (0, 255, 0), 3)
@@ -455,7 +519,7 @@ def draw_faces_on_image(img_array, faces):
 
 # Main app
 st.title("🌟 Celebrity Image Classifier")
-st.markdown("Upload a photo to discover which famous celebrities you resemble!")
+st.markdown("Upload a photo to discover which famous celebrities you *resemble* (for entertainment only).")
 
 # Check available backends
 openai_client = get_openai_client()
@@ -465,32 +529,37 @@ use_ai_mode = openai_client is not None
 use_ml_mode = feature_model is not None
 
 if not use_ai_mode and not use_ml_mode:
-    st.error("No analysis backend available. Please ensure TensorFlow is installed.")
+    st.error(
+        "No analysis backend available. "
+        "Set OPENAI_API_KEY to enable AI Vision Mode, or install TensorFlow (where supported) for demo mode."
+    )
     st.stop()
 
 # Sidebar
 with st.sidebar:
     st.header("How It Works")
+    if not CV2_AVAILABLE:
+        st.warning("OpenCV (cv2) is unavailable. Face detection may be limited.\n\nDetails: " + CV2_IMPORT_ERROR)
     
     if use_ai_mode:
         st.success("🔮 **AI Vision Mode Active**")
         st.markdown("""
-        Using advanced AI vision to analyze your photo:
+        Using advanced AI vision to analyze your photo (lookalike suggestions only):
         1. **Upload Photo** - Provide a clear face image
         2. **Face Detection** - OpenCV locates faces
         3. **AI Analysis** - GPT-5 Vision analyzes features
-        4. **Celebrity Matching** - AI identifies lookalikes
+        4. **Lookalike Suggestions** - AI suggests celebrities you resemble
         """)
     else:
         st.info("🎭 **Demo Mode Active**")
         st.markdown("""
-        Using neural network feature analysis:
+        Using a lightweight local analysis fallback:
         1. **Upload Photo** - Provide a clear face image
         2. **Face Detection** - OpenCV locates faces
         3. **Feature Extraction** - MobileNetV2 analyzes image
-        4. **Fun Matching** - Generates entertainment results
+        4. **Fun Matching** - Generates entertainment results (not a real identity system)
         
-        *Add OpenAI API key for accurate celebrity matching*
+        *Add OpenAI API key for higher-quality lookalike suggestions*
         """)
     
     st.divider()
@@ -557,16 +626,22 @@ def process_single_image(image, face_cascade, feature_model, openai_client, use_
     
     # Perform analysis
     if use_ai_mode:
-        base64_img = image_to_base64(image)
+        # Prefer sending the face region to reduce background noise and improve consistency
+        base64_img = image_to_base64(face_image)
         result = analyze_with_openai(openai_client, base64_img)
         
-        if "error" not in result:
+        if "error" in result:
+            analysis_notes = f"AI analysis failed: {result['error']}"
+        else:
             matches = result.get("matches", [])
             analysis_notes = result.get("analysis_notes", "")
     
-    if not matches and feature_model is not None:
-        features = extract_features(face_image, feature_model)
+    if not matches:
         image_props = analyze_image_properties(face_image)
+        if feature_model is not None:
+            features = extract_features(face_image, feature_model)
+        else:
+            features = extract_local_features(face_image)
         matches = match_celebrities_with_features(features, image_props, confidence_threshold)
     
     return {
@@ -700,11 +775,12 @@ if uploaded_files and len(uploaded_files) > 0 and uploaded_files[0] is not None:
         current_ai_mode = use_ai_mode
         if current_ai_mode:
             with st.spinner("🧠 AI is analyzing your photo..."):
-                base64_img = image_to_base64(image)
+                # Prefer sending the face region to reduce background noise and improve consistency
+                base64_img = image_to_base64(face_image)
                 result = analyze_with_openai(openai_client, base64_img)
             
             if "error" in result:
-                st.warning(f"AI analysis failed: {result['error']}. Falling back to ML mode.")
+                st.warning(f"AI analysis failed: {result['error']}. Falling back to local mode.")
                 current_ai_mode = False
             else:
                 matches = result.get("matches", [])
@@ -712,8 +788,11 @@ if uploaded_files and len(uploaded_files) > 0 and uploaded_files[0] is not None:
         
         if not current_ai_mode:
             with st.spinner("🧠 Analyzing facial features..."):
-                features = extract_features(face_image, feature_model)
                 image_props = analyze_image_properties(face_image)
+                if feature_model is not None:
+                    features = extract_features(face_image, feature_model)
+                else:
+                    features = extract_local_features(face_image)
                 matches = match_celebrities_with_features(features, image_props, confidence_threshold)
                 analysis_notes = ""
         
