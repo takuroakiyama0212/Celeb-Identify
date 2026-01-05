@@ -1,0 +1,14 @@
+.venv/
+.local/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Env files (do not commit secrets)
+.env
+.env.*
+
+
