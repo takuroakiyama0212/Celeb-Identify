@@ -6,9 +6,12 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.3.5",
     "openai>=2.9.0",
-    "opencv-python>=4.11.0.86",
+    # Use headless OpenCV everywhere to avoid Linux/GL runtime issues on hosted platforms.
     "opencv-python-headless>=4.11.0.86",
     "pillow>=12.0.0",
     "streamlit>=1.52.1",
-    "tensorflow>=2.20.0",
 ]
+
+[project.optional-dependencies]
+# Optional heavy demo dependency. Not required for normal operation.
+tensorflow = ["tensorflow>=2.20.0; sys_platform != 'darwin' or platform_machine == 'arm64'"]
